@@ -7,7 +7,7 @@ use panic_halt as _;
 use smt32f4xx_hal::{
     i2c::Mode as I2cMode,
     can::Mode as CanMode,
-    spi::Mode as SpiMode,
+    spi::{self, Mode as SpiMode, Phase, Polarity},
     usb::Mode as UsbMode,
     gpio::*,
     pac::{self},
