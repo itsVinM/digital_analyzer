@@ -1,0 +1,7 @@
+# config.toml
+
+[target.thumbv7em-none-eabihf]
+runner = "probe-run --chip STM32F401RE"
+rustflags = [
+"-C", "link-arg=-Tlink.x",
+]

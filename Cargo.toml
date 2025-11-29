@@ -1,0 +1,22 @@
+[package]
+name = "STM32F_Init"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = [] 
+adc_debug = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+cortex-m = "0.7.5"
+cortex-m-rt = "0.7.5"
+fugit = "0.3.9"
+panic-halt = "1.0.0"
+stm32f4xx-hal = { version = "0.22.0", features = ["stm32f401"] }
+
