@@ -60,6 +60,7 @@ enum Request {
     ReadBattI,
     ReadTemps
     ReadAc, // voltage, frequency
+    ReadState,
 }
 
 fn encode_request(req:Request, out: &mu Vec<u8, 64>){
@@ -67,11 +68,11 @@ fn encode_request(req:Request, out: &mu Vec<u8, 64>){
     // ASCII for EDS-500
     let cmd = match req {
         Request::ReadVout  => b"get v_out\r\n",
-        Request::ReadIout  => b"READ:IOUT?\r\n",
-        Request::ReadBattV => b"READ:VBATT?\r\n",
-        Request::ReadBattI => b"READ:IBATT?\r\n",
-        Request::ReadTemps => b"READ:TEMP?\r\n",
-        Request::ReadAc    => b"READ:AC?\r\n",
+        Request::ReadIout  => b"get i_converter\r\n",
+        Request::ReadBattV => b"get v_bat\r\n",
+        Request::ReadBattI => b"gte i_bat\r\n",
+        Request::ReadTemps => b"get temp_int\r\n",
+        Request::States    => b"get state\r\n",
     };
 
     let _ = pout.extend_from_slice(cmd);
@@ -168,7 +169,92 @@ mod app {
     }
 
     // HEARTBEAT - LED
+    #[task(local = [led])]
+    fn heartbeat_task(cx: heartbeat_task::Context){
+        cx.local.led.toggle();
+        heartbeat_task::spawn_after(HEARTBEAT_INTERVAL.millis()),ok();
+    }
     
-    
+    // POLLING SCHEDULER
+    #[task(shared = [req_index], local = [product_tx, tx_buf], priority = 2)]
+    fn polling_task(mut cx: polling_task::Context){
+        // round-robin request list
+        let requests: &[Request] = &[
+            Request::ReadAc,
+            Request::ReadVout,
+            Request::ReadIout,
+            Request::ReadBattV,
+            Request::ReadBattI,
+            Request::ReadTemps,
+            Request::ReadState,
+        ];
+
+        let idx = *cx.shared.req_index;
+        let req = requests[idx as usize % requests.len()];
+
+        // Encode and send
+        encode_request(req, cx.local.tx_buf);
+        for b in cx.local.tx_buf.iter(){
+            // Spin until sent
+            nb::block!(cx.local.product_tx.write(*b)).ok();
+        }
+
+        *cx.shared.req_index = (idx +1) %(requests.len() as u8);
+        response_timeout::spawn_after(RESP_TIMEOUT_MS.millis()).ok();
+        polling_task::spawn_after(POLLING_INTERVAL.millis()).ok();
+    }
+
+    // --- response timeout ---
+    #[task(local) = [awaiting_resp], priority = 2]
+    fn response_timeout(cx: response_timeout::Context){
+        if *cx.local.awaiting_resp
+        // can trigger retry or raise an alarm
+        *cx.local.awaiting_resp = false;
+    }
+
+
+    // USART1 interrupt handlers
+    #[task(binds = USART1, local = [product_rx, rx_line, awaiting_resp], shared = [telemetry], priority =3)]
+    fn usart1_rx(mut cx: usart1_rx::Context){
+        while let Ok(byte) = cx.local.product_rx.read(){
+            let ch = byte as char;
+            if ch == '\n' {
+                // assuming CRLF parse it - ful line
+                let line = cx.local.rx_line.as_str();
+                cx.local.awaiting_resp = false;
+
+                cx.shared.telemetry.lock(|tel| {
+                    parse_line(line, tel);
+                });
+
+                //clear buffer
+                cx.local.rx_line.clear();
+            }else if ch != '\r'{
+                // Accumulate - bounded
+                if cx.local.rx_line.push(ch).is_err(){
+                    // overflow - reset line
+                    cx.local.rx_line.clear();
+                }
+            }
+        }
+    }
+
+
+    // Dump telemetry periodically
+    #[task(shared = [telemetry], local = [debug_tx], priority =1)]
+    fn dump_telemetry(mut cx: dump_telemetry::Contex){
+        cx.shared.telemetry.lock(|t|{
+            let _ = writeln!(
+                cx.local.debug.tx,
+                "AC {:.1}Vac {:.2}Hz PF={:?} | DC {:.2}V {:.2}A | Batt {:.2}V {:.2}A T(b)={:?} T(c)={:?}",
+                t.ac_voltage_rms, t.ac_frequency_hz, t.power_factor,
+                t.dc_output_voltage, t.dc_output_current,
+                t.battery_voltage, t.battery_current,
+                t.battery_temperature_c, t.charger_temperature_c,
+            );
+        });
+        dump_telemetry::spawn_after(1000_u32.millis()).ok();
+
+    }
 }
   
