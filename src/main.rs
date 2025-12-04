@@ -4,229 +4,171 @@
 use panic_halt as _;
 use stm32f4xx_hal as hal;
 use rtic::app;
-use core::time::Duration;
-use hal::prelude::*; // Import traits like .split() and .constrain()
+
+use hal::prelude::*;
 use hal::serial::config::Config;
 use fugit::RateExtU32;
+use core::fmt::Write;
+use heapless::{spsc::Queue, String, Vec}:
+// Monotonic using systick
+use rtic_monotonics::systick::Systick;
 
-// Telemetry Structures for Modular Shared State
-use fugit::ExtU32;
+// Poll cadence and timeouts
+const POLLING_INTERVAL: u32 = 1000;             // Pool every 1 s
+const HEARTBEAT_INTERVAL: u32 = 500;            // Blink LED
+const RESP_TIMEOUT_MS: u32 = 200;               // response timepout per request
+const MAX_LINE_LEN: usize = 96;                 // expected max ASCII response
 
-/// Holds all polled and validated data points for the entire system.
+/// Telemetry container (portable; populate from parsed frames)
+#[derive(Debug, Clone)]
 pub struct TelemetryData {
-    pub voltage_rms: f32,
-    pub current_rms: f32,
-    pub validation_status: ValidationStatus, 
-}
+    // AC input
+    pub ac_voltage_rms: f32,    // VAC
+    pub ac_frequency_hz: f32,   // Hz
+    // DC output
+    pub dc_output_voltage: f32, // V
+    pub dc_output_current: f32, // A
+    pub unit_temp: f32, // C
 
-#[derive(Debug, PartialEq, Copy, Clone)]
-pub enum ValidationStatus {
-    Initializing,
-    Polling,
-    TestInProgress,
-    Pass,
-    Fail,
+    // Battery & charger telemetry
+    pub battery_voltage: f32,   // V
+    pub battery_current: f32,   // A (charging + / discharging - if signed)
+
 }
 
 impl Default for TelemetryData {
     fn default() -> Self {
         TelemetryData {
-            voltage_rms: 0.0,
-            current_rms: 0.0,
-            validation_status: ValidationStatus::Initializing,
+            ac_voltage_rms:     0.0,
+            ac_frequency_hz:    0.0,
+            dc_output_voltage:  0.0,
+            dc_output_current:  0.0,
+            unit_temp:          0.0,
+            battery_voltage:    0.0,
+            battery_current:    0.0,
         }
     }
 }
 
-// Constants (using fugit for type-safe duration)
-const POLLING_INTERVAL: u32 = 100;
-const CONTROL_SEQUENCE_START: u32 = 5000;
-const HEARTBEAT_INTERVAL: u32 = 500;
 
-// Setup the RTIC Monotonic Timer using TIM2.
-// NOTE: You need to add `rtic-monotonics` crate and enable the `stm32` feature.
-use rtic_monotonics::systick::*; // Systick is simpler for the F401RE
+// RS232 request sent
+#[derive(Debug, Clone, Copy)]
+enum Request {
+    ReadVout,
+    ReadIout, 
+    ReadBattV,
+    ReadBattI,
+    ReadTemps
+    ReadAc, // voltage, frequency
+}
+
+fn encode_request(req:Request, out: &mu Vec<u8, 64>){
+    out.clear();
+    // ASCII for EDS-500
+    let cmd = match req {
+        Request::ReadVout  => b"get v_out\r\n",
+        Request::ReadIout  => b"READ:IOUT?\r\n",
+        Request::ReadBattV => b"READ:VBATT?\r\n",
+        Request::ReadBattI => b"READ:IBATT?\r\n",
+        Request::ReadTemps => b"READ:TEMP?\r\n",
+        Request::ReadAc    => b"READ:AC?\r\n",
+    };
+
+    let _ = pout.extend_from_slice(cmd);
+}
 
 #[app(device = hal::pac, peripherals = true, dispatchers = [USART1])]
 mod app {
     use super::*;
     use hal::gpio::*;
     use hal::pac;
-    use core::fmt::Write; // For debug logging via serial
-
-    // ----------------------------------------------------------------------
-    // SHARED RESOURCES (The modular approach)
-    // ----------------------------------------------------------------------
-    #[shared]
-    struct Shared {
-        product_telemetry: TelemetryData,
+    
+    // --- Shared state ---
+    #[share]
+    struct Shared{
+        telemetry: TelemetryData,
+        req_index: u8, //scheduler state
     }
 
-    // ----------------------------------------------------------------------
-    // LOCAL RESOURCES (Peripherals)
-    // ----------------------------------------------------------------------
+    // --- Local resources ---
     #[local]
-    struct Local {
-        // Nucleo LED is PC13, not PA5 on the F401RE
-        led: PC13<Output<PushPull>>, 
-        // We now hold the Uart peripherals
-        product_uart_tx: hal::serial::Tx<pac::USART1>,
-        product_uart_rx: hal::serial::Rx<pac::USART1>,
-        debug_uart: hal::serial::Tx<pac::USART2>, // For logging to PC
+    struct Local{
+        // LED
+        led::gpio::PA5<Output<PushPull>>,
+
+        // Product UART
+        product_tx: hal::serial::TX<pac::USART1>,
+        product_rx: hal::serial::RX<pac::USART1>,
+
+        // Debug UART
+        debug_tx:   hal::serial::TX<pac::USART2>,
+
+        // TX/RX buffers
+        tx_buf: Vec<u8, 64>,
+        rx_line: String<MAX_LINE_LEN>,
+        // Response time
+        awaiting_resp: bool,
     }
 
-    // ----------------------------------------------------------------------
-    // INITIALIZATION
-    // ----------------------------------------------------------------------
+    // --- INIT --
     #[init]
-    fn init(mut cx: init::Context) -> (Shared, Local, init::Monotonics) {
-        // Promote HAL peripherals
-        let dp: hal::pac::Peripherals = cx.device;
-        let c_peripherals = cx.core;
+    fn init(cx: init::Context) -> (Shared, Local, init::Monotonics){
+        let dp = cx.device;
+        let mut syst = cx.core.SYST;
 
-        // 1. Clock Configuration (using HSI as default)
+        //clocks - hse 8MHz -> syscl 84 MHz
         let rcc = dp.RCC.constrain();
-        let clocks = rcc.cfgr.use_hse(8.mhz()).sysclk(84.mhz()).freeze(); // 8Mhz HSE, 84Mhz Sysclk
+        let clock = rc..cfgr.use_hse(8.MHz()).sysclk(84.mhz()).freeze();
 
-        // 2. Monotonic Timer Setup
-        // Initialize Systick as the RTIC monotonic timer
-        // We use the Monotonic trait implementation from rtic-monotonics
-        Systick::start(c_peripherals.SYST, clocks.sysclk().to_Hz());
-        
-        // 3. GPIO Setup
-        let gpioa = dp.GPIOA.split();
-        let gpioc = dp.GPIOC.split();
-        
-        // LED: PC13 (User LED on Nucleo F401RE)
-        let mut led = gpioc.pc13.into_push_pull_output();
-        led.set_low().unwrap(); // Turn off LED initially
+        // Start systick monotonic
+        Systick::start(&mut syst, clocks.sysclk().to_Hz());
 
-        // 4. USART2 (Debug Link) - PA2 (TX), PA3 (RX) - AF7
+        // GPIO
+        let gpioa= dp.GPIOA.split();
+        let mut led = gpioa.pa5.into_push_pull_output();
+        let.set_low();
+
+        // Debug USART2 (PA2 TX, PA3 RX, AF7), 9600
         let tx2 = gpioa.pa2.into_alternate_af7();
         let rx2 = gpioa.pa3.into_alternate_af7();
-        let (mut debug_uart, _) = hal::serial::Serial::usart2(
-            dp.USART2, (tx2, rx2), 
-            Config::default().baudrate(115200.bps()), // Standard debug rate
-            &clocks
-        ).unwrap().split();
+        let (mut debug_tx, _) = hal::serial::Serial::usart2(
+            dp.USART2, (tx2, rx2), Config::default().baudrate(9_600.bps()), &clocks)
+            .unwrap().split();
+        
+            let _ = writeln!(debug_tx, "Boot: RS232 poller starting...");
 
-        // 5. USART1 (Product Link) - PA9 (TX), PA10 (RX) - AF7
+        // Product USART1 (PA9 TX, PA10 RX, AF7), 1152000
         let tx1 = gpioa.pa9.into_alternate_af7();
         let rx1 = gpioa.pa10.into_alternate_af7();
-        let (product_uart_tx, product_uart_rx) = hal::serial::Serial::usart1(
-            dp.USART1, (tx1, rx1), 
-            Config::default().baudrate(9600.bps()), // Check your product manual!
-            &clocks
-        ).unwrap().split();
-
-        // Log boot message (optional)
-        writeln!(debug_uart, "System Booted. Starting tasks.").unwrap();
-
-
-        // 6. TASK SCHEDULING
-        // Note the use of .millis() from fugit
-        polling_task::spawn().unwrap();
-        heartbeat_task::spawn().unwrap();
-        control_task::spawn_after(CONTROL_SEQUENCE_START.millis()).unwrap();
+        let serial1 = hal::serial::Serial::usart1(
+            dp.USART1, (tx1, rx1), Config::default().baudrate(115_200.bps()), &clocks)
+            .unwrap().split();
         
+        let (mut product_tx, mut product_rx) = serial1;
+
+        // Enable RXNE interrupt on USART1
+        product_rx.listen(Event::Rxne);
+        
+        // Start task
+        heartbeat_task::spawn().ok();
+        polling_task::spawn().ok();
         (
-            Shared { product_telemetry: TelemetryData::default() },
-            Local { led, product_uart_tx, product_uart_rx, debug_uart },
-            init::Monotonics(), // Initialize the Systick Monotonic
+            Shared {telemetry: TelemetryData::default(), req_index: 0},
+            Local{
+                led,
+                product_tx,
+                product_rx,
+                debug_tx,
+                tx_buf: Vec::new(),
+                rx_line: String::new(),
+                awaiting_resp: false,
+            },
+            init::Monotonics()
         )
     }
 
-    // ----------------------------------------------------------------------
-    // TASKS
-    // ----------------------------------------------------------------------
-
-    // --- Task 1: Heartbeat (Low Priority) ---
-    #[task(local = [led])]
-    fn heartbeat_task(cx: heartbeat_task::Context) {
-        cx.local.led.toggle().unwrap();
-        heartbeat_task::spawn_after(HEARTBEAT_INTERVAL.millis()).unwrap();
-    }
-
-    // --- Task 2: Constant Polling (Medium Priority) ---
-    #[task(local = [product_uart_tx, product_uart_rx, debug_uart], shared = [product_telemetry])]
-    fn polling_task(mut cx: pooling_task::Context) {
-        let (tx, rx) = (cx.local.product_uart_tx, cx.local.product_uart_rx);
-        let debug_tx = cx.local.debug_uart;
-        
-        // 1. Send GET Command for Voltage
-        let cmd = create_get_voltage_cmd(); 
-        
-        // --- This is where non-blocking I/O is crucial ---
-        // For simplicity here, we use a *mock* exchange:
-        let result = tx_rx_protocol_exchange(tx, rx, &cmd);
-        
-        if let Ok(voltage) = result {
-             // 2. Update Shared Resource Safely
-             cx.shared.product_telemetry.lock(|data| {
-                data.voltage_rms = voltage;
-                data.validation_status = ValidationStatus::Polling; // Update system status
-             });
-             // Log success to PC debug terminal
-             let _ = writeln!(debug_tx, "Polling: V={:.2}V", voltage);
-        } else {
-             let _ = writeln!(debug_tx, "Polling failed.");
-        }
-
-        // 3. Schedule next execution
-        polling_task::spawn_after(POLLING_INTERVAL.millis()).unwrap();
-    }
-
-    // --- Task 3: Control and Validation Sequence (High Priority) ---
-    #[task(local = [product_uart_tx, product_uart_rx, debug_uart], shared =[product_telemetry])]
-    fn control_task(mut cx: control_task::Context) {
-        let (tx, rx) = (cx.local.product_uart_tx, cx.local.product_uart_rx);
-        let debug_tx = cx.local.debug_uart;
-
-        cx.shared.product_telemetry.lock(|data| data.validation_status = ValidationStatus::TestInProgress);
-        let _ = writeln!(debug_tx, "--- Starting Verification Sequence ---");
-
-        // --- Step 1: Set a Control Limit ---
-        let set_cmd = create_set_limit_cmd(10.0);
-        
-        if tx_rx_protocol_exchange(tx, rx, &set_cmd).is_err() {
-            cx.shared.product_telemetry.lock(|data| data.validation_status = ValidationStatus::Fail);
-            let _ = writeln!(debug_tx, "Verification FAIL: Could not set limit.");
-            return;
-        }
-        let _ = writeln!(debug_tx, "Limit set successfully.");
-
-        // --- Step 2: Use Polling Data for Context ---
-        let current_v = cx.shared.product_telemetry.lock(|data| data.voltage_rms);
-        let _ = writeln!(debug_tx, "Current Polled Voltage: {:.2}V", current_v);
-        
-        // We do not re-spawn this task unless we want it to loop/retry.
-        // For a one-shot validation, the task simply completes.
-    }
-
-    // ----------------------------------------------------------------------
-    // HELPER FUNCTIONS (Placeholders for Protocol/IO Logic)
-    // ----------------------------------------------------------------------
-
-    /// Placeholder: In a real app, this MUST be non-blocking (Interrupts/DMA)
-    fn tx_rx_protocol_exchange(tx: &mut hal::serial::Tx<pac::USART1>, rx: &mut hal::serial::Rx<pac::USART1>, cmd: &[u8]) -> Result<f32, ()> {
-        // Send command bytes, wait for response, parse, and validate CRC
-        
-        // Mock success return
-        Ok(10.5) 
-    }
-
-    /// Logs message to the debug UART (blocking for simplicity here)
-    fn log_debug_message(tx: &mut hal::serial::Tx<pac::USART2>, message: &str) {
-         // The writeln! macro handles the conversion and output, but it's blocking in this context.
-         let _ = writeln!(tx, "{}", message);
-    }
-
-
-    fn create_get_voltage() -> [u8: 8]{ [0x01, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00] }
-    fn create_get_limit_cmd() -> [u8; 8] { [0x01, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00] }
-    fn create_set_limit_cmd(_limit: f32) -> [u8:8]{ [0x01, 0x03, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00] }
-    fn setup_uart1_pins(uart: &pac::USART1, ...) -> (hal::serial::Tx<pac::USART1>, hal::serial::Rx<pac::USART1>){todo!()}
-    fn setup_usart2_debug_pins(uart: &pac::USART2, ...) -> hal::serial::Tx<pac::USART2> {todo!()}
-
-
+    // HEARTBEAT - LED
+    
+    
 }
+  
