@@ -1,0 +1,68 @@
+{
+    "product_type": "EDS-500",
+    "serial": {
+        "baud_rate": 115200,
+        "parity": "None",       
+        "data_bits": "Eight",   
+        "stop_bits": "One",    
+        "flow_control": "None", 
+        "polling_interval_ms": 100 
+    },
+    "commands":[
+        {
+            "command": "get v_out",
+            "plots":[
+                {
+                    "name": "Bus Voltage (V)",
+                    "data_key": "v_out=",
+                    "color":[1.0, 0.0, 0.0],
+                    "y_min": 0.0,
+                    "y_max": 100
+                }
+            ]
+            
+        },
+        {
+            "command": "get i_converter",
+            "plots":[
+                {
+                    "name": "I converter (A):        ",
+                    "data_key": "i_converter=",
+                    "color":[1.0, 0.0, 0.0],
+                    "y_min": 0.0,
+                    "y_max": 100
+                }
+            ]
+        },
+        {
+            "command": "get temp_int",
+            "plots":[
+                {
+                    "name": "Internal temperature (C)",
+                    "data_key": "temp_int=",
+                    "color":[1.0, 0.0, 0.0],
+                    "y_min": 0.0,
+                    "y_max": 100
+                }
+            ]
+        },
+        {
+            "command": "get state",
+            "plots":[
+                {
+                    "name": "State :                    ",
+                    "data_key": "state=",
+                    "color":[1.0, 0.0, 0.0],
+                    "y_min": 0.0,
+                    "y_max": 100
+                }
+            ]
+        }
+    ],
+    "product_parameters":{
+        "TARGET_VOLTAGE": "48.0",
+        "CURRENT_LIMIT": "10",
+        "DEBUG_MODE": "OFF"
+    }
+
+}
