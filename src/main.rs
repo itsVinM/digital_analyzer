@@ -58,7 +58,7 @@ pub struct CommandConfig {
 #[derive(Deserialize, Debug, Clone)]
 pub struct AppConfig {
     pub product_type: String, 
-    pub serial: SerialConfig, // New: Holds all serial port settings
+    pub serial: SerialConfig, 
     pub commands: Vec<CommandConfig>,
     pub product_parameters: HashMap<String, String>,
 }
@@ -77,17 +77,15 @@ pub struct PlotState {
 }
 
 // --- SerialPlotterApp Structure Update ---
-
 pub struct SerialPlotterApp {
     available_ports: Vec<SerialPortInfo>,
-    selected_port_name: String,
-    
+    selected_port_name: String, 
     is_connected: bool,
     port_handle: Option<thread::JoinHandle<()>>, 
     serial_tx: Option<Sender<bool>>,
     
     config_file_path: String,
-    loaded_config: Option<AppConfig>, // Used to pass config to worker
+    loaded_config: Option<AppConfig>, 
     config_load_error: Option<String>,
 
     plot_states: Vec<PlotState>, 
@@ -95,15 +93,10 @@ pub struct SerialPlotterApp {
     log_history: VecDeque<String>,
     app_tx_main: Sender<PlotData>, 
     app_rx: Receiver<PlotData>,
-    start_time: Instant,
-    
-    // Removed: active_baud_rate and polling_interval_ms
-    
+    start_time: Instant,    
     editable_params: HashMap<String, String>,
     params_tx: Option<Sender<HashMap<String, String>>>,
-    
     user_cmd_tx: Option<Sender<String>>,
-    // Removed: interval_tx
     command_input: String,
 }
 
