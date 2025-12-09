@@ -208,7 +208,7 @@ fn to_serial_flow_control(f: &ConfigFlowControl) -> serialport::FlowControl {
 
 fn serial_worker(
     port_name: String,
-    serial_config: SerialConfig, // New: Full config struct passed here
+    serial_config: SerialConfig, 
     commands: Vec<CommandConfig>,
     app_tx: Sender<PlotData>,
     stop_rx: Receiver<bool>,
